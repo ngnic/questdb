@@ -209,7 +209,7 @@ public class WalWriter implements Closeable {
             CharSequence root,
             Metrics metrics
     ) {
-        LOG.info().$("open '").utf8(tableName).$('\'').$();
+        LOG.info().$("open wal'").utf8(tableName).$('\'').$();
         this.configuration = configuration;
         this.metrics = metrics;
         this.ownMessageBus = ownMessageBus;

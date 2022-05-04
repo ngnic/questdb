@@ -376,7 +376,7 @@ class LineTcpMeasurementScheduler implements Closeable {
                 // get writer here to avoid constructing
                 // object instance and potentially leaking memory if
                 // writer allocation fails
-                engine.getWriter(securityContext, tableNameUtf16, "tcpIlp"),
+                engine.getWalWriter(securityContext, tableNameUtf16, "tcpIlp"),
                 threadId,
                 netIoJobs
         );

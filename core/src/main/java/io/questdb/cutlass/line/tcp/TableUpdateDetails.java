@@ -54,7 +54,7 @@ public class TableUpdateDetails implements Closeable {
     // Number of rows processed since the last reshuffle, this is an estimate because it is incremented by
     // multiple threads without synchronisation
     private long eventsProcessedSinceReshuffle = 0;
-    private TableWriter writer;
+    private WalWriter writer;
     private boolean assignedToJob = false;
     private long lastMeasurementMillis = Long.MAX_VALUE;
     private long nextCommitTime;
@@ -64,7 +64,7 @@ public class TableUpdateDetails implements Closeable {
     TableUpdateDetails(
             LineTcpReceiverConfiguration configuration,
             CairoEngine engine,
-            TableWriter writer,
+            WalWriter writer,
             int writerThreadId,
             NetworkIOJob[] netIoJobs
     ) {
@@ -258,7 +258,7 @@ public class TableUpdateDetails implements Closeable {
         return timestampIndex;
     }
 
-    TableWriter getWriter() {
+    WalWriter getWriter() {
         return writer;
     }
 

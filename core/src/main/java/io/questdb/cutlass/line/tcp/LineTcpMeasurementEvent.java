@@ -25,6 +25,7 @@
 package io.questdb.cutlass.line.tcp;
 
 import io.questdb.cairo.*;
+import io.questdb.cairo.pool.WalPool;
 import io.questdb.cutlass.line.LineProtoTimestampAdapter;
 import io.questdb.log.Log;
 import io.questdb.log.LogFactory;
@@ -86,9 +87,9 @@ class LineTcpMeasurementEvent implements Closeable {
     }
 
     void append() throws CommitFailedException {
-        TableWriter.Row row = null;
+        WalWriter.Row row = null;
         try {
-            TableWriter writer = tableUpdateDetails.getWriter();
+            WalWriter writer = tableUpdateDetails.getWriter();
             long offset = buffer.getAddress();
             long timestamp = buffer.readLong(offset);
             offset += Long.BYTES;

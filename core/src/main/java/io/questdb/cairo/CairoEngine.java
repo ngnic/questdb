@@ -30,6 +30,7 @@ import io.questdb.Metrics;
 import io.questdb.cairo.mig.EngineMigration;
 import io.questdb.cairo.pool.PoolListener;
 import io.questdb.cairo.pool.ReaderPool;
+import io.questdb.cairo.pool.WalPool;
 import io.questdb.cairo.pool.WriterPool;
 import io.questdb.cairo.pool.WriterSource;
 import io.questdb.cairo.sql.ReaderOutOfDateException;
@@ -56,6 +57,8 @@ public class CairoEngine implements Closeable, WriterSource {
     public static final String BUSY_READER = "busyReader";
     private static final Log LOG = LogFactory.getLog(CairoEngine.class);
     private final WriterPool writerPool;
+
+    private final WalPool walPool;
     private final ReaderPool readerPool;
     private final CairoConfiguration configuration;
     private final Metrics metrics;
@@ -80,6 +83,7 @@ public class CairoEngine implements Closeable, WriterSource {
         this.metrics = metrics;
         this.messageBus = new MessageBusImpl(configuration);
         this.writerPool = new WriterPool(configuration, messageBus, metrics);
+        this.walPool = new WalPool(configuration, messageBus, metrics);
         this.readerPool = new ReaderPool(configuration, messageBus);
         this.engineMaintenanceJob = new EngineMaintenanceJob(configuration);
         if (configuration.getTelemetryConfiguration().getEnabled()) {
@@ -324,6 +328,15 @@ public class CairoEngine implements Closeable, WriterSource {
     ) {
         securityContext.checkWritePermission();
         return writerPool.get(tableName, lockReason);
+    }
+
+    public WalWriter getWalWriter(
+            CairoSecurityContext securityContext,
+            CharSequence tableName,
+            CharSequence lockReason
+    ) {
+        securityContext.checkWritePermission();
+        return walPool.get(tableName, lockReason);
     }
 
     public CharSequence lock(
