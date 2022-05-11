@@ -125,13 +125,14 @@ class LineTcpMeasurementEvent implements Closeable {
                         row.cancel();
                         row = null;
                         final int colType = defaultColumnTypes.MAPPED_COLUMN_TYPES[entityType];
-                        writer.addColumn(columnName, colType);
+                        throw new UnsupportedOperationException("todo");
+//                        writer.addColumn(columnName, colType);
 
                         // Seek to beginning of entities
-                        offset = Long.BYTES + Integer.BYTES + buffer.getAddress();
-                        nEntity = -1;
-                        row = writer.newRow(timestamp);
-                        continue;
+//                        offset = Long.BYTES + Integer.BYTES + buffer.getAddress();
+//                        nEntity = -1;
+//                        row = writer.newRow(timestamp);
+//                        continue;
                     }
                 }
 

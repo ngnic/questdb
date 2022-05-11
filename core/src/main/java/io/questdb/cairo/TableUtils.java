@@ -67,6 +67,8 @@ public final class TableUtils {
     public static final long META_OFFSET_STRUCTURE_VERSION = 32; // LONG
     public static final String FILE_SUFFIX_I = ".i";
     public static final String FILE_SUFFIX_D = ".d";
+
+    public static final String FILE_SUFFIX_WAL = ".w";
     public static final int LONGS_PER_TX_ATTACHED_PARTITION = 4;
     public static final int LONGS_PER_TX_ATTACHED_PARTITION_MSB = Numbers.msb(LONGS_PER_TX_ATTACHED_PARTITION);
     public static final String DEFAULT_PARTITION_NAME = "default";
@@ -105,6 +107,8 @@ public final class TableUtils {
     public static final int TX_RECORD_HEADER_SIZE = (int) TX_OFFSET_MAP_WRITER_COUNT_32 + Integer.BYTES;
 
     public static final long COLUMN_NAME_TXN_NONE = -1L;
+
+    public static final long WAL_TXN_NONE = -1L;
 
     /**
      * TXN file structure
@@ -355,6 +359,14 @@ public final class TableUtils {
         path.concat(columnName).put(FILE_SUFFIX_D);
         if (columnTxn > COLUMN_NAME_TXN_NONE) {
             path.put('.').put(columnTxn);
+        }
+        return path.$();
+    }
+
+    public static LPSZ walFile(Path path, long walTxn) {
+        path.concat("wal").put(FILE_SUFFIX_WAL);
+        if (walTxn > WAL_TXN_NONE) {
+            path.put('.').put(walTxn);
         }
         return path.$();
     }
