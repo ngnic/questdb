@@ -27,7 +27,6 @@ package io.questdb.cairo;
 import io.questdb.MessageBus;
 import io.questdb.MessageBusImpl;
 import io.questdb.Metrics;
-import io.questdb.cairo.sql.RecordMetadata;
 import io.questdb.cairo.sql.SymbolTable;
 import io.questdb.cairo.vm.NullMapWriter;
 import io.questdb.cairo.vm.Vm;
@@ -38,7 +37,6 @@ import io.questdb.cairo.vm.api.MemoryMARW;
 import io.questdb.cairo.vm.api.MemoryMR;
 import io.questdb.cairo.vm.api.NullMemory;
 import io.questdb.griffin.AlterStatement;
-import io.questdb.griffin.SqlException;
 import io.questdb.griffin.model.IntervalUtils;
 import io.questdb.log.Log;
 import io.questdb.log.LogFactory;
@@ -46,7 +44,6 @@ import io.questdb.log.LogRecord;
 import io.questdb.mp.MPSequence;
 import io.questdb.mp.RingQueue;
 import io.questdb.mp.SCSequence;
-import io.questdb.mp.SOCountDownLatch;
 import io.questdb.mp.Sequence;
 import io.questdb.std.BinarySequence;
 import io.questdb.std.CharSequenceHashSet;
@@ -65,26 +62,20 @@ import io.questdb.std.NumericException;
 import io.questdb.std.ObjList;
 import io.questdb.std.Sinkable;
 import io.questdb.std.Unsafe;
-import io.questdb.std.Vect;
 import io.questdb.std.datetime.DateFormat;
 import io.questdb.std.datetime.microtime.Timestamps;
 import io.questdb.std.str.LPSZ;
 import io.questdb.std.str.Path;
 import io.questdb.std.str.StringSink;
-import io.questdb.tasks.ColumnIndexerTask;
 import io.questdb.tasks.TableWriterTask;
 import org.jetbrains.annotations.NotNull;
 
 import java.io.Closeable;
 import java.util.function.LongConsumer;
 
-import static io.questdb.cairo.StatusCode.CANNOT_ATTACH_MISSING_PARTITION;
-import static io.questdb.cairo.StatusCode.PARTITION_ALREADY_ATTACHED;
-import static io.questdb.cairo.StatusCode.PARTITION_EMPTY;
 import static io.questdb.cairo.TableUtils.*;
 
 public class WalWriter implements Closeable {
-    public static final int TIMESTAMP_MERGE_ENTRY_BYTES = Long.BYTES * 2;
     private static final int ROW_ACTION_OPEN_PARTITION = 0;
     private static final int ROW_ACTION_NO_PARTITION = 1;
     private static final int ROW_ACTION_NO_TIMESTAMP = 2;
@@ -116,9 +107,6 @@ public class WalWriter implements Closeable {
     private final CairoConfiguration configuration;
     private final LowerCaseCharSequenceIntHashMap validationMap = new LowerCaseCharSequenceIntHashMap();
     private final FragileCode RECOVER_FROM_META_RENAME_FAILURE = this::recoverFromMetaRenameFailure;
-    private final SOCountDownLatch indexLatch = new SOCountDownLatch();
-    private final LongList indexSequences = new LongList();
-    private final TxReader slaveTxReader;
     // This is the same message bus. When TableWriter instance created via CairoEngine, message bus is shared
     // and is owned by the engine. Since TableWriter would not have ownership of the bus it must not free it up.
     // On other hand when TableWrite is created outside CairoEngine, primarily in tests, the ownership of the
@@ -127,7 +115,6 @@ public class WalWriter implements Closeable {
     // will be released by the writer
     private final MessageBus messageBus;
     private final MessageBus ownMessageBus;
-    private final boolean parallelIndexerEnabled;
     private final PartitionBy.PartitionFloorMethod partitionFloorMethod;
     private final PartitionBy.PartitionCeilMethod partitionCeilMethod;
     private final int defaultCommitMode;
@@ -154,7 +141,6 @@ public class WalWriter implements Closeable {
     private long lockFd = -1;
     private LongConsumer timestampSetter;
     private int columnCount;
-    private boolean avoidIndexOnCommit = false;
     private long partitionTimestampHi;
     private long masterRef = 0;
     private boolean removeDirOnCancelRow = true;
@@ -164,13 +150,10 @@ public class WalWriter implements Closeable {
     private final FragileCode RECOVER_FROM_TODO_WRITE_FAILURE = this::recoverFromTodoWriteFailure;
     private final FragileCode RECOVER_FROM_SYMBOL_MAP_WRITER_FAILURE = this::recoverFromSymbolMapWriterFailure;
     private final FragileCode RECOVER_FROM_SWAP_RENAME_FAILURE = this::recoverFromSwapRenameFailure;
-    private final FragileCode RECOVER_FROM_COLUMN_OPEN_FAILURE = this::recoverOpenColumnFailure;
-    private int indexCount;
     private boolean performRecovery;
     private boolean distressed = false;
     private LifecycleManager lifecycleManager;
     private String designatedTimestampColumnName;
-    private long lastPartitionTimestamp;
     private ObjList<? extends MemoryA> activeColumns;
     private ObjList<Runnable> activeNullSetters;
     private int rowActon = ROW_ACTION_OPEN_PARTITION;
@@ -220,7 +203,6 @@ public class WalWriter implements Closeable {
         }
         this.defaultCommitMode = configuration.getCommitMode();
         this.lifecycleManager = lifecycleManager;
-        this.parallelIndexerEnabled = configuration.isParallelIndexingEnabled();
         this.ff = configuration.getFilesFacade();
         this.mkDirMode = configuration.getMkDirMode();
         this.fileOperationRetryCount = configuration.getFileOperationRetryCount();
@@ -296,7 +278,6 @@ public class WalWriter implements Closeable {
             configureAppendPosition();
             purgeUnusedPartitions();
             clearTodoLog();
-            this.slaveTxReader = new TxReader(ff);
             commandQueue = new RingQueue<>(
                     TableWriterTask::new,
                     configuration.getWriterCommandQueueSlotSize(),
@@ -415,9 +396,6 @@ public class WalWriter implements Closeable {
 
         // add column objects
         configureColumn(type, isIndexed, columnCount);
-        if (isIndexed) {
-            populateDenseIndexerList();
-        }
 
         // increment column count
         columnCount++;
@@ -435,7 +413,7 @@ public class WalWriter implements Closeable {
             try {
                 openNewColumnFiles(name, isIndexed, indexValueBlockCapacity);
             } catch (CairoException e) {
-                runFragile(RECOVER_FROM_COLUMN_OPEN_FAILURE, name, e);
+//                runFragile(RECOVER_FROM_COLUMN_OPEN_FAILURE, name, e);
             }
         }
 
@@ -455,211 +433,6 @@ public class WalWriter implements Closeable {
         metadata.addColumn(name, configuration.getRandom().nextLong(), type, isIndexed, indexValueBlockCapacity, columnIndex);
 
         LOG.info().$("ADDED column '").utf8(name).$('[').$(ColumnType.nameOf(type)).$("], name txn ").$(columnNameTxn).$(" to ").$(path).$();
-    }
-
-    public void addIndex(CharSequence columnName, int indexValueBlockSize) {
-        assert indexValueBlockSize == Numbers.ceilPow2(indexValueBlockSize) : "power of 2 expected";
-
-        checkDistressed();
-
-        final int columnIndex = getColumnIndexQuiet(metaMem, columnName, columnCount);
-
-        if (columnIndex == -1) {
-            throw CairoException.instance(0).put("column '").put(columnName).put("' does not exist");
-        }
-
-        commit();
-
-        if (isColumnIndexed(metaMem, columnIndex)) {
-            throw CairoException.instance(0).put("already indexed [column=").put(columnName).put(']');
-        }
-
-        final int existingType = getColumnType(metaMem, columnIndex);
-        LOG.info().$("adding index to '").utf8(columnName).$('[').$(ColumnType.nameOf(existingType)).$(", path=").$(path).$(']').$();
-
-        if (!ColumnType.isSymbol(existingType)) {
-            LOG.error().$("cannot create index for [column='").utf8(columnName).$(", type=").$(ColumnType.nameOf(existingType)).$(", path=").$(path).$(']').$();
-            throw CairoException.instance(0).put("cannot create index for [column='").put(columnName).put(", type=").put(ColumnType.nameOf(existingType)).put(", path=").put(path).put(']');
-        }
-
-        // create indexer
-        final SymbolColumnIndexer indexer = new SymbolColumnIndexer();
-
-        final long columnNameTxn = columnVersionWriter.getColumnNameTxn(txWriter.getLastPartitionTimestamp(), columnIndex);
-        try {
-            try {
-                // edge cases here are:
-                // column spans only part of table - e.g. it was added after table was created and populated
-                // column has top value, e.g. does not span entire partition
-                // to this end, we have a super-edge case:
-
-                // This piece of code is unbelievably fragile!
-                if (PartitionBy.isPartitioned(partitionBy)) {
-                    // run indexer for the whole table
-                    indexHistoricPartitions(indexer, columnName, indexValueBlockSize);
-                    long timestamp = txWriter.getMaxTimestamp();
-                    if (timestamp != Numbers.LONG_NaN) {
-                        path.trimTo(rootLen);
-                        setStateForTimestamp(path, timestamp, false);
-                        // create index in last partition
-                        indexLastPartition(indexer, columnName, columnNameTxn, columnIndex, indexValueBlockSize);
-                    }
-                } else {
-                    setStateForTimestamp(path, 0, false);
-                    // create index in last partition
-                    indexLastPartition(indexer, columnName, columnNameTxn, columnIndex, indexValueBlockSize);
-                }
-            } finally {
-                path.trimTo(rootLen);
-            }
-        } catch (Throwable e) {
-            LOG.error().$("rolling back index created so far [path=").$(path).$(']').$();
-            removeIndexFiles(columnName, columnIndex);
-            throw e;
-        }
-
-        // set index flag in metadata
-        // create new _meta.swp
-
-        metaSwapIndex = copyMetadataAndSetIndexed(columnIndex, indexValueBlockSize);
-
-        // close _meta so we can rename it
-        metaMem.close();
-
-        // validate new meta
-        validateSwapMeta(columnName);
-
-        // rename _meta to _meta.prev
-        renameMetaToMetaPrev(columnName);
-
-        // after we moved _meta to _meta.prev
-        // we have to have _todo to restore _meta should anything go wrong
-        writeRestoreMetaTodo(columnName);
-
-        // rename _meta.swp to -_meta
-        renameSwapMetaToMeta(columnName);
-
-        try {
-            // open _meta file
-            openMetaFile(ff, path, rootLen, metaMem);
-
-            // remove _todo
-            clearTodoLog();
-
-        } catch (CairoException err) {
-            throwDistressException(err);
-        }
-
-        bumpStructureVersion();
-        indexers.extendAndSet(columnIndex, indexer);
-        populateDenseIndexerList();
-
-        TableColumnMetadata columnMetadata = metadata.getColumnQuick(columnIndex);
-        columnMetadata.setIndexed(true);
-        columnMetadata.setIndexValueBlockCapacity(indexValueBlockSize);
-
-        LOG.info().$("ADDED index to '").utf8(columnName).$('[').$(ColumnType.nameOf(existingType)).$("]' to ").$(path).$();
-    }
-
-    public int attachPartition(long timestamp) {
-        // Partitioned table must have a timestamp
-        // SQL compiler will check that table is partitioned
-        assert metadata.getTimestampIndex() > -1;
-
-        CharSequence timestampCol = metadata.getColumnQuick(metadata.getTimestampIndex()).getName();
-        if (txWriter.attachedPartitionsContains(timestamp)) {
-            LOG.info().$("partition is already attached [path=").$(path).$(']').$();
-            return PARTITION_ALREADY_ATTACHED;
-        }
-
-        boolean rollbackRename = false;
-        try {
-            setPathForPartition(path, partitionBy, timestamp, false);
-            if (!ff.exists(path.$())) {
-                setPathForPartition(other, partitionBy, timestamp, false);
-                other.put(DETACHED_DIR_MARKER);
-
-                if (ff.exists(other.$())) {
-                    if (ff.rename(other, path)) {
-                        rollbackRename = true;
-                        LOG.info().$("moved partition dir: ").$(other).$(" to ").$(path).$();
-                    } else {
-                        throw CairoException.instance(ff.errno()).put("File system error on trying to rename [from=")
-                                .put(other).put(",to=").put(path).put(']');
-                    }
-                }
-            }
-
-            if (ff.exists(path.$())) {
-                // find out lo, hi ranges of partition attached as well as size
-                final long partitionSize = readPartitionSizeMinMax(ff, path, timestampCol, tempMem16b, timestamp);
-                if (partitionSize > 0) {
-                    if (inTransaction()) {
-                        LOG.info().$("committing open transaction before applying attach partition command [table=").$(tableName)
-                                .$(",partition=").$ts(timestamp).I$();
-                        commit();
-                    }
-
-                    attachPartitionCheckFilesMatchMetadata(ff, path, getMetadata(), partitionSize);
-                    long minPartitionTimestamp = Unsafe.getUnsafe().getLong(tempMem16b);
-                    long maxPartitionTimestamp = Unsafe.getUnsafe().getLong(tempMem16b + 8);
-
-                    assert timestamp <= minPartitionTimestamp && minPartitionTimestamp <= maxPartitionTimestamp;
-
-                    long nextMinTimestamp = Math.min(minPartitionTimestamp, txWriter.getMinTimestamp());
-                    long nextMaxTimestamp = Math.max(maxPartitionTimestamp, txWriter.getMaxTimestamp());
-                    boolean appendPartitionAttached = size() == 0 || getPartitionLo(nextMaxTimestamp) > getPartitionLo(txWriter.getMaxTimestamp());
-
-                    txWriter.beginPartitionSizeUpdate();
-                    txWriter.updatePartitionSizeByTimestamp(timestamp, partitionSize);
-                    txWriter.finishPartitionSizeUpdate(nextMinTimestamp, nextMaxTimestamp);
-                    txWriter.bumpTruncateVersion();
-                    txWriter.commit(defaultCommitMode, denseSymbolMapWriters);
-                    if (appendPartitionAttached) {
-                        freeColumns(true);
-                        configureAppendPosition();
-                    }
-
-                    LOG.info().$("partition attached [path=").$(path).$(']').$();
-                    rollbackRename = false;
-                } else {
-                    LOG.error().$("cannot detect partition size [path=").$(path).$(",timestampColumn=").$(timestampCol).$(']').$();
-                    return PARTITION_EMPTY;
-                }
-            } else {
-                LOG.error().$("cannot attach missing partition [path=").$(path).$(']').$();
-                return CANNOT_ATTACH_MISSING_PARTITION;
-            }
-        } finally {
-            if (rollbackRename) {
-                // rename back to .detached
-                // otherwise it can be deleted on writer re-open
-                if (ff.rename(path.$(), other.$())) {
-                    LOG.info().$("moved partition dir after failed attach attempt: ").$(path).$(" to ").$(other).$();
-                } else {
-                    LOG.info().$("file system error on trying to rename partition folder [errno=").$(ff.errno())
-                            .$(",from=").$(path).$(",to=").$(other).I$();
-                }
-            }
-            path.trimTo(rootLen);
-            other.trimTo(rootLen);
-        }
-
-        return StatusCode.OK;
-    }
-
-    public void changeCacheFlag(int columnIndex, boolean cache) {
-        checkDistressed();
-
-        commit();
-
-        MapWriter symbolMapWriter = getSymbolMapWriter(columnIndex);
-        if (symbolMapWriter.isCached() != cache) {
-            symbolMapWriter.updateCacheFlag(cache);
-        } else {
-            return;
-        }
-        updateMetaStructureVersion();
     }
 
     @Override
@@ -903,9 +676,6 @@ public class WalWriter implements Closeable {
 
         // remove column objects
         removeColumn(index);
-
-        // remove symbol map writer or entry for such
-        removeSymbolMapWriter(index);
 
         // reset timestamp limits
         if (timestamp) {
@@ -1221,21 +991,6 @@ public class WalWriter implements Closeable {
         this.commitInterval = calculateCommitInterval();
     }
 
-    /**
-     * Eagerly sets up writer instance. Otherwise, writer will initialize lazily. Invoking this method could improve
-     * performance of some applications. UDP receivers use this in order to avoid initial receive buffer contention.
-     */
-    public void warmUp() {
-        Row r = newRow(Math.max(Timestamps.O3_MIN_TS, txWriter.getMaxTimestamp()));
-        try {
-            for (int i = 0; i < columnCount; i++) {
-                r.putByte(i, (byte) 0);
-            }
-        } finally {
-            r.cancel();
-        }
-    }
-
     private static void removeFileAndOrLog(FilesFacade ff, LPSZ name) {
         if (ff.exists(name)) {
             if (ff.remove(name)) {
@@ -1253,17 +1008,6 @@ public class WalWriter implements Closeable {
             } else {
                 LOG.error().$("cannot rename: ").utf8(name).$(" [errno=").$(ff.errno()).$(']').$();
             }
-        }
-    }
-
-    static void indexAndCountDown(ColumnIndexer indexer, long lo, long hi, SOCountDownLatch latch) {
-        try {
-            indexer.refreshSourceAndIndex(lo, hi);
-        } catch (CairoException e) {
-            indexer.distress();
-            LOG.critical().$("index error [fd=").$(indexer.getFd()).$(']').$('{').$((Sinkable) e).$('}').$();
-        } finally {
-            latch.countDown();
         }
     }
 
@@ -1367,196 +1111,6 @@ public class WalWriter implements Closeable {
         }
     }
 
-    private void attachPartitionCheckFilesMatchFixedColumn(FilesFacade ff, Path path, int columnType, long partitionSize, String columnName, long columnNameTxn) {
-        TableUtils.dFile(path, columnName, columnNameTxn);
-        if (ff.exists(path.$())) {
-            long fileSize = ff.length(path);
-            if (fileSize < partitionSize << ColumnType.pow2SizeOf(columnType)) {
-                throw CairoException.instance(0)
-                        .put("Column file is too small. ")
-                        .put("Partition files inconsistent [file=")
-                        .put(path)
-                        .put(", expectedSize=")
-                        .put(partitionSize << ColumnType.pow2SizeOf(columnType))
-                        .put(", actual=")
-                        .put(fileSize)
-                        .put(']');
-            }
-            return;
-        }
-        throw CairoException.instance(0).put("Column file does not exist [path=").put(path).put(']');
-    }
-
-    private void attachPartitionCheckFilesMatchMetadata(FilesFacade ff, Path path, RecordMetadata metadata, long partitionSize) throws CairoException {
-        // for each column, check that file exists in the partition folder
-        int rootLen = path.length();
-        for (int columnIndex = 0, size = metadata.getColumnCount(); columnIndex < size; columnIndex++) {
-            try {
-                int columnType = metadata.getColumnType(columnIndex);
-                final String columnName = metadata.getColumnName(columnIndex);
-                long columnNameTxn = columnVersionWriter.getDefaultColumnNameTxn(columnIndex);
-
-                switch (ColumnType.tagOf(columnType)) {
-                    case ColumnType.INT:
-                    case ColumnType.LONG:
-                    case ColumnType.BOOLEAN:
-                    case ColumnType.BYTE:
-                    case ColumnType.TIMESTAMP:
-                    case ColumnType.DATE:
-                    case ColumnType.DOUBLE:
-                    case ColumnType.CHAR:
-                    case ColumnType.SHORT:
-                    case ColumnType.FLOAT:
-                    case ColumnType.LONG256:
-                    case ColumnType.GEOBYTE:
-                    case ColumnType.GEOSHORT:
-                    case ColumnType.GEOINT:
-                    case ColumnType.GEOLONG:
-                        attachPartitionCheckFilesMatchFixedColumn(ff, path, columnType, partitionSize, columnName, columnNameTxn);
-                        break;
-                    case ColumnType.STRING:
-                    case ColumnType.BINARY:
-                        attachPartitionCheckFilesMatchVarLenColumn(ff, path, partitionSize, columnName, columnNameTxn);
-                        break;
-                    case ColumnType.SYMBOL:
-                        attachPartitionCheckSymbolColumn(ff, path, columnIndex, partitionSize, columnName, columnNameTxn);
-                        break;
-                }
-            } finally {
-                path.trimTo(rootLen);
-            }
-        }
-    }
-
-    private void attachPartitionCheckFilesMatchVarLenColumn(FilesFacade ff, Path path, long partitionSize, String columnName, long columnNameTxn) {
-        int pathLen = path.length();
-        TableUtils.dFile(path, columnName, columnNameTxn);
-        long dataLength = ff.length(path.$());
-
-        path.trimTo(pathLen);
-        TableUtils.iFile(path, columnName, columnNameTxn);
-
-        if (dataLength >= 0 && ff.exists(path.$())) {
-            int typeSize = Long.BYTES;
-            long indexFd = openRO(ff, path, LOG);
-            try {
-                long fileSize = ff.length(indexFd);
-                long expectedFileSize = (partitionSize + 1) * typeSize;
-                if (fileSize < expectedFileSize) {
-                    throw CairoException.instance(0)
-                            .put("Column file is too small. ")
-                            .put("Partition files inconsistent [file=")
-                            .put(path)
-                            .put(",expectedSize=")
-                            .put(expectedFileSize)
-                            .put(",actual=")
-                            .put(fileSize)
-                            .put(']');
-                }
-
-                long mappedAddr = mapRO(ff, indexFd, expectedFileSize, MemoryTag.MMAP_DEFAULT);
-                try {
-                    long prevDataAddress = dataLength - 4;
-                    for (long offset = partitionSize * typeSize; offset >= 0; offset -= typeSize) {
-                        long dataAddress = Unsafe.getUnsafe().getLong(mappedAddr + offset);
-                        if (dataAddress < 0 || dataAddress > dataLength) {
-                            throw CairoException.instance(0).put("Variable size column has invalid data address value [path=").put(path)
-                                    .put(", indexOffset=").put(offset)
-                                    .put(", dataAddress=").put(dataAddress)
-                                    .put(", dataFileSize=").put(dataLength)
-                                    .put(']');
-                        }
-
-                        // Check that addresses are monotonic
-                        if (dataAddress >= prevDataAddress) {
-                            throw CairoException.instance(0).put("Variable size column has invalid data address value [path=").put(path)
-                                    .put(", indexOffset=").put(offset)
-                                    .put(", dataAddress=").put(dataAddress)
-                                    .put(", prevDataAddress=").put(prevDataAddress)
-                                    .put(", dataFileSize=").put(dataLength)
-                                    .put(']');
-                        }
-                        prevDataAddress = dataAddress;
-                    }
-                    return;
-                } finally {
-                    ff.munmap(mappedAddr, expectedFileSize, MemoryTag.MMAP_DEFAULT);
-                }
-            } finally {
-                ff.close(indexFd);
-            }
-        }
-        throw CairoException.instance(0).put("Column file does not exist [path=").put(path).put(']');
-    }
-
-    private void attachPartitionCheckSymbolColumn(FilesFacade ff, Path path, int columnIndex, long partitionSize, String columnName, long columnNameTxn) {
-        int pathLen = path.length();
-        TableUtils.dFile(path, columnName, columnNameTxn);
-        long fd = openRO(ff, path.$(), LOG);
-        try {
-            long fileSize = ff.length(fd);
-            int typeSize = Integer.BYTES;
-            long expectedSize = partitionSize * typeSize;
-            if (fileSize < expectedSize) {
-                throw CairoException.instance(0)
-                        .put("Column file is too small. ")
-                        .put("Partition files inconsistent [file=")
-                        .put(path)
-                        .put(", expectedSize=")
-                        .put(expectedSize)
-                        .put(", actual=")
-                        .put(fileSize)
-                        .put(']');
-            }
-
-            long address = mapRO(ff, fd, fileSize, MemoryTag.MMAP_DEFAULT);
-            try {
-                int maxKey = Vect.maxInt(address, partitionSize);
-                int symbolValues = symbolMapWriters.getQuick(columnIndex).getSymbolCount();
-                if (maxKey >= symbolValues) {
-                    throw CairoException.instance(0)
-                            .put("Symbol file does not match symbol column [file=")
-                            .put(path)
-                            .put(", key=")
-                            .put(maxKey)
-                            .put(", columnKeys=")
-                            .put(symbolValues)
-                            .put(']');
-                }
-                int minKey = Vect.minInt(address, partitionSize);
-                if (minKey < 0) {
-                    throw CairoException.instance(0)
-                            .put("Symbol file does not match symbol column, invalid key [file=")
-                            .put(path)
-                            .put(", key=")
-                            .put(minKey)
-                            .put(']');
-                }
-            } finally {
-                ff.munmap(address, fileSize, MemoryTag.MMAP_DEFAULT);
-            }
-
-            if (metadata.isColumnIndexed(columnIndex)) {
-                BitmapIndexUtils.valueFileName(path.trimTo(pathLen), columnName, columnNameTxn);
-                if (!ff.exists(path.$())) {
-                    throw CairoException.instance(0)
-                            .put("Symbol index value file does not exist [file=")
-                            .put(path)
-                            .put(']');
-                }
-                BitmapIndexUtils.keyFileName(path.trimTo(pathLen), columnName, columnNameTxn);
-                if (!ff.exists(path.$())) {
-                    throw CairoException.instance(0)
-                            .put("Symbol index key file does not exist [file=")
-                            .put(path)
-                            .put(']');
-                }
-            }
-        } finally {
-            ff.close(fd);
-        }
-    }
-
     private int addColumnToMeta(
             CharSequence name,
             int type,
@@ -1639,25 +1193,6 @@ public class WalWriter implements Closeable {
         throw new CairoError("Table '" + tableName + "' is distressed");
     }
 
-    private boolean checkScoreboardHasReadersBeforeLastCommittedTxn() {
-        long lastCommittedTxn = txWriter.getTxn();
-        try {
-            if (txnScoreboard.acquireTxn(lastCommittedTxn)) {
-                txnScoreboard.releaseTxn(lastCommittedTxn);
-            }
-        } catch (CairoException ex) {
-            // Scoreboard can be over allocated, don't stall writing because of that.
-            // Schedule async purge and continue
-            LOG.error().$("cannot lock last txn in scoreboard, partition purge will be scheduled [table=")
-                    .$(tableName)
-                    .$(", txn=").$(lastCommittedTxn)
-                    .$(", error=").$(ex.getFlyweightMessage())
-                    .$(", errno=").$(ex.getErrno()).I$();
-        }
-
-        return txnScoreboard.getMin() != lastCommittedTxn;
-    }
-
     private void clearTodoLog() {
         try {
             todoMem.putLong(0, ++todoTxn); // write txn, reader will first read txn at offset 24 and then at offset 0
@@ -1727,7 +1262,6 @@ public class WalWriter implements Closeable {
             final long committedRowCount = txWriter.unsafeCommittedFixedRowCount() + txWriter.unsafeCommittedTransientRowCount();
             final long rowsAdded = txWriter.getRowCount() - committedRowCount;
 
-            updateIndexes();
             columnVersionWriter.commit();
             txWriter.setColumnVersion(columnVersionWriter.getVersion());
             txWriter.commit(commitMode, this.denseSymbolMapWriters);
@@ -2236,7 +1770,6 @@ public class WalWriter implements Closeable {
     private void openFirstPartition(long timestamp) {
         final long ts = repairDataGaps(timestamp);
         openPartition(ts);
-        populateDenseIndexerList();
         setAppendPosition(txWriter.getTransientRowCount(), false);
         if (performRecovery) {
             performRecovery();
@@ -2299,27 +1832,12 @@ public class WalWriter implements Closeable {
                 if (metadata.getColumnType(i) > 0) {
                     final CharSequence name = metadata.getColumnName(i);
                     long columnNameTxn = columnVersionWriter.getColumnNameTxn(partitionTimestamp, i);
-                    final ColumnIndexer indexer = metadata.isColumnIndexed(i) ? indexers.getQuick(i) : null;
                     final long columnTop;
-
-                    // prepare index writer if column requires indexing
-                    if (indexer != null) {
-                        // we have to create files before columns are open
-                        // because we are reusing MAMemoryImpl object from columns list
-                        createIndexFiles(name, columnNameTxn, metadata.getIndexValueBlockCapacity(i), plen, txWriter.getTransientRowCount() < 1);
-                        indexer.closeSlider();
-                    }
-
                     openColumnFiles(name, columnNameTxn, i, plen);
                     columnTop = columnVersionWriter.getColumnTop(partitionTimestamp, i);
                     columnTops.extendAndSet(i, columnTop);
-
-                    if (indexer != null) {
-                        indexer.configureFollowerAndWriter(configuration, path, name, columnNameTxn, getPrimaryColumn(i), columnTop);
-                    }
                 }
             }
-            populateDenseIndexerList();
             LOG.info().$("switched partition [path='").$(path).$('\'').I$();
         } catch (Throwable e) {
             distressed = true;
@@ -2364,17 +1882,6 @@ public class WalWriter implements Closeable {
         rollbackIndexes();
         rollbackSymbolTables();
         performRecovery = false;
-    }
-
-    private void populateDenseIndexerList() {
-        denseIndexers.clear();
-        for (int i = 0, n = indexers.size(); i < n; i++) {
-            ColumnIndexer indexer = indexers.getQuick(i);
-            if (indexer != null) {
-                denseIndexers.add(indexer);
-            }
-        }
-        indexCount = denseIndexers.size();
     }
 
     private void processAlterTableEvent(TableWriterTask cmd, long cursor, Sequence sequence, boolean acceptStructureChange) {
@@ -2470,15 +1977,6 @@ public class WalWriter implements Closeable {
         openMetaFile(ff, path, rootLen, metaMem);
     }
 
-    private void recoverOpenColumnFailure(CharSequence columnName) {
-        final int index = columnCount - 1;
-        removeMetaFile();
-        removeLastColumn();
-        columnCount--;
-        recoverFromSwapRenameFailure(columnName);
-        removeSymbolMapWriter(index);
-    }
-
     private void releaseLock(boolean distressed) {
         if (lockFd != -1L) {
             ff.close(lockFd);
@@ -2502,7 +2000,6 @@ public class WalWriter implements Closeable {
         freeAndRemoveColumnPair(columns, pi, si);
         if (columnIndex < indexers.size()) {
             Misc.free(indexers.getAndSetQuick(columnIndex, null));
-            populateDenseIndexerList();
         }
     }
 
@@ -2686,20 +2183,6 @@ public class WalWriter implements Closeable {
             removeFileAndOrLog(ff, BitmapIndexUtils.valueFileName(path.trimTo(rootLen), name, columnNamTxn));
         } finally {
             path.trimTo(rootLen);
-        }
-    }
-
-    private void removeSymbolMapWriter(int index) {
-        MapWriter writer = symbolMapWriters.getAndSetQuick(index, NullMapWriter.INSTANCE);
-        if (writer != null && writer != NullMapWriter.INSTANCE) {
-            int symColIndex = denseSymbolMapWriters.remove(writer);
-            // Shift all subsequent symbol indexes by 1 back
-            while (symColIndex < denseSymbolMapWriters.size()) {
-                MapWriter w = denseSymbolMapWriters.getQuick(symColIndex);
-                w.setSymbolIndexInTxWriter(symColIndex);
-                symColIndex++;
-            }
-            Misc.free(writer);
         }
     }
 
@@ -2989,11 +2472,6 @@ public class WalWriter implements Closeable {
         }
     }
 
-    private void resizeColumnTopSink(long srcOoo, long srcOooMax) {
-        long maxPartitionsAffected = (srcOooMax - srcOoo) / PartitionBy.getPartitionTimeIntervalFloor(partitionBy) + 2;
-        long size = maxPartitionsAffected * (metadata.getColumnCount() + 1);
-    }
-
     private void restoreMetaFrom(CharSequence fromBase, int fromIndex) {
         try {
             path.concat(fromBase);
@@ -3210,7 +2688,6 @@ public class WalWriter implements Closeable {
         // Before partition can be switched we need to index records
         // added so far. Index writers will start point to different
         // files after switch.
-        updateIndexes();
         txWriter.switchPartitions(timestamp);
         openPartition(timestamp);
         setAppendPosition(0, false);
@@ -3230,125 +2707,6 @@ public class WalWriter implements Closeable {
     private void throwDistressException(Throwable cause) {
         this.distressed = true;
         throw new CairoError(cause);
-    }
-
-    private void updateIndexes() {
-        if (indexCount == 0 || avoidIndexOnCommit) {
-            avoidIndexOnCommit = false;
-            return;
-        }
-        updateIndexesSlow();
-    }
-
-    private void updateIndexesParallel(long lo, long hi) {
-        indexSequences.clear();
-        indexLatch.setCount(indexCount);
-        final int nParallelIndexes = indexCount - 1;
-        final Sequence indexPubSequence = this.messageBus.getIndexerPubSequence();
-        final RingQueue<ColumnIndexerTask> indexerQueue = this.messageBus.getIndexerQueue();
-
-        LOG.info().$("parallel indexing [table=").$(tableName)
-                .$(", indexCount=").$(indexCount)
-                .$(", rowCount=").$(hi - lo)
-                .I$();
-        int serialIndexCount = 0;
-
-        // we are going to index last column in this thread while other columns are on the queue
-        OUT:
-        for (int i = 0; i < nParallelIndexes; i++) {
-
-            long cursor = indexPubSequence.next();
-            if (cursor == -1) {
-                // queue is full, process index in the current thread
-                indexAndCountDown(denseIndexers.getQuick(i), lo, hi, indexLatch);
-                serialIndexCount++;
-                continue;
-            }
-
-            if (cursor == -2) {
-                // CAS issue, retry
-                do {
-                    cursor = indexPubSequence.next();
-                    if (cursor == -1) {
-                        indexAndCountDown(denseIndexers.getQuick(i), lo, hi, indexLatch);
-                        serialIndexCount++;
-                        continue OUT;
-                    }
-
-                } while (cursor < 0);
-            }
-
-            final ColumnIndexerTask queueItem = indexerQueue.get(cursor);
-            final ColumnIndexer indexer = denseIndexers.getQuick(i);
-            final long sequence = indexer.getSequence();
-            queueItem.indexer = indexer;
-            queueItem.lo = lo;
-            queueItem.hi = hi;
-            queueItem.countDownLatch = indexLatch;
-            queueItem.sequence = sequence;
-            indexSequences.add(sequence);
-            indexPubSequence.done(cursor);
-        }
-
-        // index last column while other columns are brewing on the queue
-        indexAndCountDown(denseIndexers.getQuick(indexCount - 1), lo, hi, indexLatch);
-        serialIndexCount++;
-
-        // At this point we have re-indexed our column and if things are flowing nicely
-        // all other columns should have been done by other threads. Instead of actually
-        // waiting we gracefully check latch count.
-        if (!indexLatch.await(configuration.getWorkStealTimeoutNanos())) {
-            // other columns are still in-flight, we must attempt to steal work from other threads
-            for (int i = 0; i < nParallelIndexes; i++) {
-                ColumnIndexer indexer = denseIndexers.getQuick(i);
-                if (indexer.tryLock(indexSequences.getQuick(i))) {
-                    indexAndCountDown(indexer, lo, hi, indexLatch);
-                    serialIndexCount++;
-                }
-            }
-            // wait for the ones we cannot steal
-            indexLatch.await();
-        }
-
-        // reset lock on completed indexers
-        boolean distressed = false;
-        for (int i = 0; i < indexCount; i++) {
-            ColumnIndexer indexer = denseIndexers.getQuick(i);
-            distressed = distressed | indexer.isDistressed();
-        }
-
-        if (distressed) {
-            throwDistressException(null);
-        }
-
-        LOG.info().$("parallel indexing done [serialCount=").$(serialIndexCount).$(']').$();
-    }
-
-    private void updateIndexesSerially(long lo, long hi) {
-        LOG.info().$("serial indexing [table=").$(tableName)
-                .$(", indexCount=").$(indexCount)
-                .$(", rowCount=").$(hi - lo)
-                .I$();
-        for (int i = 0, n = denseIndexers.size(); i < n; i++) {
-            try {
-                denseIndexers.getQuick(i).refreshSourceAndIndex(lo, hi);
-            } catch (CairoException e) {
-                // this is pretty severe, we hit some sort of limit
-                LOG.critical().$("index error {").$((Sinkable) e).$('}').$();
-                throwDistressException(e);
-            }
-        }
-        LOG.info().$("serial indexing done [table=").$(tableName).I$();
-    }
-
-    private void updateIndexesSlow() {
-        final long hi = txWriter.getTransientRowCount();
-        final long lo = txWriter.getAppendedPartitionCount() == 1 ? hi - txWriter.getLastTxSize() : 0;
-        if (indexCount > 1 && parallelIndexerEnabled && hi - lo > configuration.getParallelIndexThreshold()) {
-            updateIndexesParallel(lo, hi);
-        } else {
-            updateIndexesSerially(lo, hi);
-        }
     }
 
     private void updateMaxTimestamp(long timestamp) {
