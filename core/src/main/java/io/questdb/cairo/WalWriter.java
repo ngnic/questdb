@@ -192,7 +192,7 @@ public class WalWriter implements Closeable {
             CharSequence root,
             Metrics metrics
     ) {
-        LOG.info().$("open wal'").utf8(tableName).$('\'').$();
+        LOG.info().$("open wal '").utf8(tableName).$('\'').$();
         this.configuration = configuration;
         this.metrics = metrics;
         this.ownMessageBus = ownMessageBus;
@@ -448,18 +448,6 @@ public class WalWriter implements Closeable {
 
     public void commit(int commitMode) {
         commit(commitMode, 0);
-    }
-
-    public void commitWithLag() {
-        commit(defaultCommitMode, metadata.getCommitLag());
-    }
-
-    public void commitWithLag(long lagMicros) {
-        commit(defaultCommitMode, lagMicros);
-    }
-
-    public void commitWithLag(int commitMode) {
-        commit(commitMode, metadata.getCommitLag());
     }
 
     public int getColumnIndex(CharSequence name) {
@@ -1728,7 +1716,7 @@ public class WalWriter implements Closeable {
     private void lock() {
         try {
             path.trimTo(rootLen);
-            lockName(path);
+            walLockName(path);
             performRecovery = ff.exists(path);
             this.lockFd = TableUtils.lock(ff, path);
         } finally {
@@ -1985,7 +1973,7 @@ public class WalWriter implements Closeable {
             }
 
             try {
-                lockName(path);
+                walLockName(path);
                 removeOrException(ff, path);
             } finally {
                 path.trimTo(rootLen);

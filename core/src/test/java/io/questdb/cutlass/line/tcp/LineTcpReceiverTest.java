@@ -950,6 +950,15 @@ public class LineTcpReceiverTest extends AbstractLineTcpReceiverTest {
     }
 
     @Test
+    public void testSendtoWal() throws Exception {
+        runInContext(receiver -> {
+            for (;;) {
+                sendToSocket("weather,location=us-midwest temperature=85 1465839830102300200\n");
+            }
+        });
+    }
+
+    @Test
     public void testColumnTypeStaysTheSameWhileColumnAdded() throws Exception {
         final String tableName = "weather";
         final int numOfRows = 2000;

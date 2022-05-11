@@ -481,6 +481,11 @@ public final class TableUtils {
         path.put(".lock").$();
     }
 
+    public static void walLockName(Path path) {
+        path.put(".wallock").$();
+    }
+
+
     public static long mapRO(FilesFacade ff, long fd, long size, int memoryTag) {
         return mapRO(ff, fd, size, 0, memoryTag);
     }

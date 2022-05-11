@@ -254,7 +254,7 @@ public class WalPool extends AbstractPool {
 
                 if (e.lockFd != -1) {
                     ff.close(e.lockFd);
-                    TableUtils.lockName(path.of(root).concat(name));
+                    TableUtils.walLockName(path.of(root).concat(name));
                     if (!ff.remove(path)) {
                         LOG.error().$("could not remove [file=").$(path).$(']').$();
                     }
@@ -482,7 +482,7 @@ public class WalPool extends AbstractPool {
 
     private boolean lockAndNotify(long thread, Entry e, CharSequence tableName, CharSequence lockReason) {
         assertLockReason(lockReason);
-        TableUtils.lockName(path.of(root).concat(tableName));
+        TableUtils.walLockName(path.of(root).concat(tableName));
         e.lockFd = TableUtils.lock(ff, path);
         if (e.lockFd == -1L) {
             LOG.error().$("could not lock [table=`").utf8(tableName).$("`, thread=").$(thread).$(']').$();

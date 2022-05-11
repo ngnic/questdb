@@ -190,15 +190,11 @@ public class TableUpdateDetails implements Closeable {
         }
     }
 
-    private void commit(boolean withLag) throws CommitFailedException {
+    private void commit() throws CommitFailedException {
         if (writer.getUncommittedRowCount() > 0) {
             try {
-                LOG.debug().$("time-based commit " + (withLag ? "with lag " : "") + "[rows=").$(writer.getUncommittedRowCount()).$(", table=").$(tableNameUtf16).I$();
-                if (withLag) {
-                    writer.commitWithLag();
-                } else {
-                    writer.commit();
-                }
+                LOG.debug().$("time-based commit " + "[rows=").$(writer.getUncommittedRowCount()).$(", table=").$(tableNameUtf16).I$();
+                writer.commit();
             } catch (Throwable ex) {
                 setWriterInError();
                 LOG.error().$("could not commit [table=").$(tableNameUtf16).$(", e=").$(ex).I$();
@@ -218,7 +214,7 @@ public class TableUpdateDetails implements Closeable {
         }
         if (writer != null) {
             final long commitInterval = writer.getCommitInterval();
-            commit(wallClockMillis - lastMeasurementMillis < commitInterval);
+            commit();
             nextCommitTime += commitInterval;
         }
         return nextCommitTime;
@@ -237,7 +233,7 @@ public class TableUpdateDetails implements Closeable {
         nextCommitTime = millisecondClock.getTicks() + writer.getCommitInterval();
 
         try {
-            writer.commitWithLag();
+            writer.commit();
         } catch (Throwable th) {
             LOG.error()
                     .$("could not commit line protocol measurement [tableName=").$(writer.getTableName())
